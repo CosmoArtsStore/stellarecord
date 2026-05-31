@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "src-tauri",
+]
+
+[workspace.dependencies]
+serde         = { version = "1.0", features = ["derive"] }
+winreg        = "0.52"
+chrono        = { version = "0.4", features = ["serde"] }
+rusqlite      = { version = "0.38", features = ["bundled"] }
+regex         = "1"
+tauri         = { version = "2.2.4", features = [] }
+tauri-build   = { version = "2.0.5", features = [] }
+tauri-plugin-shell  = "2.3.5"
+opener        = "0.8"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "warn"
+dbg_macro = "warn"
+print_stdout = "warn"
+too_many_lines = "warn"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+# 実装影響が大きいため許容する pedantic ルール群:
+too_many_arguments = "allow"            # 引数 7 個超の関数を許可（リファクタ影響大）
+needless_pass_by_value = "allow"        # IPC コマンドの shape を保つため値渡しを許可
+case_sensitive_file_extension_comparisons = "allow"  # `output_log_*.txt` は大小区別ありで意図通り
+maybe_infinite_iter = "allow"           # null 終端 wide string 走査で安全に終端保証されているため許可
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

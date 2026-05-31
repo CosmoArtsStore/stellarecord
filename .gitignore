@@ -1,0 +1,48 @@
+# Build artifacts
+target/
+
+# Test coverage output
+coverage/
+src-tauri/coverage/
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Claude Code
+.claude/
+memory/
+
+# Design/planning tools (not part of the app)
+tools/
+
+# Internal investigation notes (not for public distribution)
+fix-task.md
+task-fix.md
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

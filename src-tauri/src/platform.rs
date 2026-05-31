@@ -1,0 +1,704 @@
+use std::path::Path;
+use std::process::Command;
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+use winreg::enums::HKEY_CURRENT_USER;
+use winreg::RegKey;
+
+use crate::utils;
+
+/// 予期しない異常終了をログファイルに記録するパニックフックを設定する。
+///
+/// `StellaRecord` はコンソールなしで動作し得るため、フロントエンドが
+/// パニック詳細を表示できなくても障害を診断可能にする。
+pub fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let location = match info.location() {
+            Some(location) => format!("{}:{}", location.file(), location.line()),
+            None => "場所を特定できませんでした".to_string(),
+        };
+        let payload = info.payload();
+        let message = if let Some(text) = payload.downcast_ref::<&str>() {
+            text.to_string()
+        } else if let Some(text) = payload.downcast_ref::<String>() {
+            text.clone()
+        } else {
+            "panic メッセージを取得できませんでした".to_string()
+        };
+
+        utils::log_err(&format!("[PANIC] {message} ({location})"));
+    }));
+}
+
+/// `StellaRecord` の多重起動を防止する。
+///
+/// 共有データベースとバックグラウンド処理を所有するため、単一インスタンス実行で
+/// 重複書き込みや UI 状態の不整合を回避する。
+///
+/// # 戻り値
+/// なし。別のインスタンスが既に起動中の場合はプロセスを即終了する。
+pub fn ensure_single_instance() {
+    #[cfg(windows)]
+    {
+        use std::mem::ManuallyDrop;
+
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+        use windows::Win32::System::Threading::CreateMutexW;
+
+        let mutex_name: Vec<u16> = "Local\\StellaRecord_SingleInstance\0"
+            .encode_utf16()
+            .collect();
+        let mutex = match unsafe { CreateMutexW(None, true, PCWSTR(mutex_name.as_ptr())) } {
+            Ok(mutex) => mutex,
+            Err(err) => {
+                utils::log_warn(&format!(
+                    "単一起動ガードを初期化できませんでした。多重起動を防げない可能性があります: {err}"
+                ));
+                return;
+            }
+        };
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            std::process::exit(0);
+        }
+        // プロセス終了までハンドルを保持し、他インスタンスが検出できるようにする。
+        let _ = ManuallyDrop::new(mutex);
+    }
+}
+
+/// Windows でコンソールウィンドウを表示せずに外部プロセスを起動する。
+///
+/// # Errors
+/// 対象の実行ファイルを起動できない場合にエラーを返す。
+pub fn launch_external_process(path: &str) -> Result<(), String> {
+    let mut cmd = Command::new(path);
+    // CREATE_NO_WINDOW (0x0800_0000) により、非コンソールプロセスから
+    // GUI アプリを起動する際のコンソール表示を抑制する。
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+
+    cmd.spawn()
+        .map_err(|err| utils::command_err(&format!("起動に失敗しました [{path}]"), err))?;
+    Ok(())
+}
+
+/// Windows スタートアップ一覧への登録・解除を行う。
+///
+/// # Errors
+/// スタートアップのレジストリキーを更新できない場合にエラーを返す。
+pub fn set_startup_enabled(value_name: &str, enabled: bool) -> Result<(), String> {
+    let run_key = RegKey::predef(HKEY_CURRENT_USER)
+        .create_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
+        .map_err(|err| utils::command_err("Run キーを開けませんでした", err))?
+        .0;
+
+    // 登録時のみ自身の実行ファイルパスを解決する（解除時は不要）。
+    let command = if enabled {
+        let executable = std::env::current_exe().map_err(|err| {
+            utils::command_err("自分自身の実行ファイルパスを取得できませんでした", err)
+        })?;
+        Some(format!("\"{}\"", executable.display()))
+    } else {
+        None
+    };
+
+    apply_startup_value(&run_key, value_name, command.as_deref())
+}
+
+/// Run キーに対するスタートアップ値の登録／解除を適用する。
+///
+/// Run キーと登録コマンドを引数で受け取ることで、実際の起動キーに触れず
+/// テスト専用キーで登録・解除・「値なし解除」の各分岐を検証できる。
+/// `command` が `Some` なら登録、`None` なら解除。解除時に値が存在しない場合は
+/// 正常終了として扱う（冪等な解除）。
+fn apply_startup_value(
+    run_key: &RegKey,
+    value_name: &str,
+    command: Option<&str>,
+) -> Result<(), String> {
+    if let Some(command) = command {
+        run_key
+            .set_value(value_name, &command.to_string())
+            .map_err(|err| utils::command_err("自動起動の登録に失敗しました", err))?;
+    } else if let Err(err) = run_key.delete_value(value_name) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            return Err(utils::command_err("自動起動の解除に失敗しました", err));
+        }
+    }
+
+    Ok(())
+}
+
+/// exe ファイルからアイコンを抽出し、PNG バイト列として返す。
+///
+/// シェルの Jumbo イメージリスト (256×256) から高解像度アイコンの取得を試み、
+/// 失敗した場合は `ExtractIconExW` (32×32) にフォールバックする。
+pub fn extract_exe_icon_png(exe_path: &Path) -> Option<Vec<u8>> {
+    extract_icon_jumbo(exe_path).or_else(|| extract_icon_legacy(exe_path))
+}
+
+/// `SHGetImageList(SHIL_JUMBO)` 経由で 256×256 アイコンを取得する。
+fn extract_icon_jumbo(exe_path: &Path) -> Option<Vec<u8>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+    use windows::Win32::UI::Controls::IImageList;
+    use windows::Win32::UI::Shell::{
+        SHGetFileInfoW, SHGetImageList, SHFILEINFOW, SHGFI_SYSICONINDEX,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, HICON};
+
+    let wide_path: Vec<u16> = exe_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let com_ok = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
+
+    let result = (|| -> Option<Vec<u8>> {
+        const SHIL_JUMBO: i32 = 4;
+        let mut file_info = SHFILEINFOW::default();
+        #[allow(clippy::cast_possible_truncation)]
+        let ret = unsafe {
+            SHGetFileInfoW(
+                windows::core::PCWSTR(wide_path.as_ptr()),
+                FILE_FLAGS_AND_ATTRIBUTES::default(),
+                Some(&raw mut file_info),
+                std::mem::size_of::<SHFILEINFOW>() as u32,
+                SHGFI_SYSICONINDEX,
+            )
+        };
+        if ret == 0 {
+            return None;
+        }
+
+        let image_list: IImageList = unsafe { SHGetImageList(SHIL_JUMBO) }.ok()?;
+
+        let hicon: HICON = unsafe { image_list.GetIcon(file_info.iIcon, 1) }.ok()?;
+        let png = hicon_to_png(hicon);
+        unsafe {
+            let _ = DestroyIcon(hicon);
+        }
+        png
+    })();
+
+    if com_ok {
+        unsafe {
+            CoUninitialize();
+        }
+    }
+    result
+}
+
+/// `ExtractIconExW` による 32×32 フォールバック。
+fn extract_icon_legacy(exe_path: &Path) -> Option<Vec<u8>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows::Win32::UI::Shell::ExtractIconExW;
+    use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, HICON};
+
+    let wide_path: Vec<u16> = exe_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut large_icon = HICON::default();
+    let count = unsafe {
+        ExtractIconExW(
+            windows::core::PCWSTR(wide_path.as_ptr()),
+            0,
+            Some(&raw mut large_icon),
+            None,
+            1,
+        )
+    };
+    if count == 0 || large_icon.is_invalid() {
+        return None;
+    }
+
+    let result = hicon_to_png(large_icon);
+    unsafe {
+        let _ = DestroyIcon(large_icon);
+    }
+    result
+}
+
+/// HICON → PNG バイト列変換。
+fn hicon_to_png(hicon: windows::Win32::UI::WindowsAndMessaging::HICON) -> Option<Vec<u8>> {
+    use std::io::Cursor;
+
+    use image::{ImageFormat, RgbaImage};
+    use windows::Win32::Graphics::Gdi::{
+        CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, GetObjectW, BITMAP,
+        BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::GetIconInfo;
+
+    let mut icon_info = windows::Win32::UI::WindowsAndMessaging::ICONINFO::default();
+    unsafe { GetIconInfo(hicon, &raw mut icon_info) }.ok()?;
+
+    let color_bmp = icon_info.hbmColor;
+    let mask_bmp = icon_info.hbmMask;
+
+    let cleanup_bitmaps = || unsafe {
+        let _ = DeleteObject(color_bmp);
+        let _ = DeleteObject(mask_bmp);
+    };
+
+    let mut bmp = BITMAP::default();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let bmp_size = std::mem::size_of::<BITMAP>() as i32;
+    if unsafe { GetObjectW(color_bmp, bmp_size, Some((&raw mut bmp).cast())) } == 0 {
+        cleanup_bitmaps();
+        return None;
+    }
+
+    let width = bmp.bmWidth;
+    let height = bmp.bmHeight;
+    if width <= 0 || height <= 0 {
+        cleanup_bitmaps();
+        return None;
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let (w, h) = (width as u32, height as u32);
+
+    #[allow(clippy::cast_possible_truncation)]
+    let mut info_header = BITMAPINFOHEADER {
+        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: width,
+        biHeight: -height, // 負値で top-down (上から下へ並ぶ DIB)
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB.0,
+        ..Default::default()
+    };
+
+    let mut pixels = vec![0u8; (w * h * 4) as usize];
+    let hdc = unsafe { CreateCompatibleDC(None) };
+
+    let scan_result = unsafe {
+        GetDIBits(
+            hdc,
+            color_bmp,
+            0,
+            h,
+            Some(pixels.as_mut_ptr().cast()),
+            (&raw mut info_header).cast(),
+            DIB_RGB_COLORS,
+        )
+    };
+
+    let _ = unsafe { DeleteDC(hdc) };
+    cleanup_bitmaps();
+
+    if scan_result == 0 {
+        return None;
+    }
+
+    // BGRA → RGBA
+    for chunk in pixels.chunks_exact_mut(4) {
+        chunk.swap(0, 2);
+    }
+
+    let img = RgbaImage::from_raw(w, h, pixels)?;
+    let mut buf = Cursor::new(Vec::new());
+    img.write_to(&mut buf, ImageFormat::Png).ok()?;
+    Some(buf.into_inner())
+}
+
+/// exe の Windows `VersionInfo` から表示名を抽出する。
+///
+/// `FileDescription` を優先し、空または取得できない場合は `ProductName` にフォールバックし、
+/// それも取得できない場合は拡張子を除いたファイル名を返す。完全に解決できない場合は `None`。
+#[cfg(windows)]
+pub fn read_exe_display_name(exe_path: &Path) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
+    };
+
+    let wide_path: Vec<u16> = exe_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let file_stem_fallback = exe_path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned());
+
+    let size = unsafe { GetFileVersionInfoSizeW(PCWSTR(wide_path.as_ptr()), None) };
+    if size == 0 {
+        return file_stem_fallback;
+    }
+
+    let mut buffer = vec![0u8; size as usize];
+    if unsafe {
+        GetFileVersionInfoW(
+            PCWSTR(wide_path.as_ptr()),
+            0,
+            size,
+            buffer.as_mut_ptr().cast(),
+        )
+    }
+    .is_err()
+    {
+        return file_stem_fallback;
+    }
+
+    // 利用可能な翻訳一覧を取得し、最初の言語/コードページ組を採用する。
+    let mut translations_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
+    let mut translations_len: u32 = 0;
+    let translation_subblock: Vec<u16> = "\\VarFileInfo\\Translation\0".encode_utf16().collect();
+    let translations_ok = unsafe {
+        VerQueryValueW(
+            buffer.as_ptr().cast(),
+            PCWSTR(translation_subblock.as_ptr()),
+            &raw mut translations_ptr,
+            &raw mut translations_len,
+        )
+    };
+
+    let mut candidate_paths: Vec<(u16, u16)> = Vec::new();
+    if translations_ok.as_bool() && !translations_ptr.is_null() && translations_len >= 4 {
+        let count = (translations_len as usize) / 4;
+        let pairs =
+            unsafe { std::slice::from_raw_parts(translations_ptr.cast::<u16>(), count * 2) };
+        for chunk in pairs.chunks_exact(2) {
+            candidate_paths.push((chunk[0], chunk[1]));
+        }
+    }
+    // 英語 (US) / Unicode のフォールバックも試す。
+    candidate_paths.push((0x0409, 0x04B0));
+    candidate_paths.push((0x0000, 0x04B0));
+
+    let lookup_string = |lang: u16, codepage: u16, field: &str| -> Option<String> {
+        let subblock = format!("\\StringFileInfo\\{lang:04x}{codepage:04x}\\{field}\0");
+        let wide: Vec<u16> = subblock.encode_utf16().collect();
+        let mut value_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
+        let mut value_len: u32 = 0;
+        let result = unsafe {
+            VerQueryValueW(
+                buffer.as_ptr().cast(),
+                PCWSTR(wide.as_ptr()),
+                &raw mut value_ptr,
+                &raw mut value_len,
+            )
+        };
+        if !result.as_bool() || value_ptr.is_null() || value_len == 0 {
+            return None;
+        }
+        let slice =
+            unsafe { std::slice::from_raw_parts(value_ptr.cast::<u16>(), value_len as usize) };
+        // 末尾の NUL を除去
+        let trimmed = match slice.iter().position(|c| *c == 0) {
+            Some(pos) => &slice[..pos],
+            None => slice,
+        };
+        let text = String::from_utf16_lossy(trimmed);
+        let trimmed_text = text.trim();
+        if trimmed_text.is_empty() {
+            None
+        } else {
+            Some(trimmed_text.to_string())
+        }
+    };
+
+    for field in ["FileDescription", "ProductName"] {
+        for (lang, codepage) in &candidate_paths {
+            if let Some(value) = lookup_string(*lang, *codepage, field) {
+                return Some(value);
+            }
+        }
+    }
+
+    file_stem_fallback
+}
+
+#[cfg(not(windows))]
+pub fn read_exe_display_name(exe_path: &Path) -> Option<String> {
+    exe_path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+}
+
+/// ネイティブファイルダイアログで exe ファイルを選択する。
+///
+/// # Errors
+/// COM 初期化やダイアログ生成に失敗した場合にエラーを返す。
+pub fn pick_exe_file_dialog() -> Result<Option<String>, String> {
+    use std::os::windows::ffi::OsStringExt;
+
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+    use windows::Win32::UI::Shell::{
+        FileOpenDialog, IFileOpenDialog, FOS_FILEMUSTEXIST, FOS_PATHMUSTEXIST, SIGDN_FILESYSPATH,
+    };
+
+    let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    if hr.is_err() {
+        return Err(format!("COM 初期化に失敗しました: {hr}"));
+    }
+
+    let result = (|| -> Result<Option<String>, String> {
+        let dialog: IFileOpenDialog =
+            unsafe { CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER) }
+                .map_err(|e| format!("ファイルダイアログを作成できませんでした: {e}"))?;
+
+        let filter_name = HSTRING::from("実行ファイル (*.exe)");
+        let filter_spec = HSTRING::from("*.exe");
+        let filters = [COMDLG_FILTERSPEC {
+            pszName: PCWSTR(filter_name.as_ptr()),
+            pszSpec: PCWSTR(filter_spec.as_ptr()),
+        }];
+
+        unsafe {
+            dialog
+                .SetFileTypes(&filters)
+                .map_err(|e| format!("フィルター設定に失敗しました: {e}"))?;
+            dialog
+                .SetOptions(FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST)
+                .map_err(|e| format!("オプション設定に失敗しました: {e}"))?;
+        }
+
+        let hr = unsafe { dialog.Show(None) };
+        if hr.is_err() {
+            return Ok(None);
+        }
+
+        let item = unsafe { dialog.GetResult() }
+            .map_err(|e| format!("選択結果を取得できませんでした: {e}"))?;
+        let display_name = unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) }
+            .map_err(|e| format!("ファイルパスを取得できませんでした: {e}"))?;
+
+        let path = unsafe {
+            let len = (0..).take_while(|&i| *display_name.0.add(i) != 0).count();
+            let slice = std::slice::from_raw_parts(display_name.0, len);
+            std::ffi::OsString::from_wide(slice)
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        unsafe { windows::Win32::System::Com::CoTaskMemFree(Some(display_name.0.cast())) };
+
+        Ok(Some(path))
+    })();
+
+    unsafe { CoUninitialize() };
+    result
+}
+
+/// ネイティブファイル選択ダイアログでログファイルを複数選択する。
+///
+/// # Errors
+/// COM 初期化やダイアログ生成に失敗した場合にエラーを返す。
+pub fn pick_log_files_dialog() -> Result<Vec<String>, String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+
+        use windows::core::{HSTRING, PCWSTR};
+        use windows::Win32::System::Com::{
+            CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+            COINIT_APARTMENTTHREADED,
+        };
+        use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+        use windows::Win32::UI::Shell::{
+            FileOpenDialog, IFileOpenDialog, FOS_ALLOWMULTISELECT, FOS_FILEMUSTEXIST,
+            FOS_PATHMUSTEXIST, SIGDN_FILESYSPATH,
+        };
+
+        let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        if hr.is_err() {
+            return Err(format!("COM 初期化に失敗しました: {hr}"));
+        }
+
+        let result = (|| -> Result<Vec<String>, String> {
+            let dialog: IFileOpenDialog =
+                unsafe { CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER) }
+                    .map_err(|e| format!("ファイルダイアログを作成できませんでした: {e}"))?;
+
+            let filter_name = HSTRING::from("VRChat ログ (*.txt;*.tar.zst)");
+            let filter_spec = HSTRING::from("output_log_*.txt;output_log_*.tar.zst");
+            let all_name = HSTRING::from("すべてのファイル (*.*)");
+            let all_spec = HSTRING::from("*.*");
+            let filters = [
+                COMDLG_FILTERSPEC {
+                    pszName: PCWSTR(filter_name.as_ptr()),
+                    pszSpec: PCWSTR(filter_spec.as_ptr()),
+                },
+                COMDLG_FILTERSPEC {
+                    pszName: PCWSTR(all_name.as_ptr()),
+                    pszSpec: PCWSTR(all_spec.as_ptr()),
+                },
+            ];
+
+            unsafe {
+                dialog
+                    .SetFileTypes(&filters)
+                    .map_err(|e| format!("フィルター設定に失敗しました: {e}"))?;
+                dialog
+                    .SetOptions(FOS_ALLOWMULTISELECT | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST)
+                    .map_err(|e| format!("オプション設定に失敗しました: {e}"))?;
+            }
+
+            let hr = unsafe { dialog.Show(None) };
+            if hr.is_err() {
+                return Ok(Vec::new());
+            }
+
+            let results = unsafe { dialog.GetResults() }
+                .map_err(|e| format!("選択結果を取得できませんでした: {e}"))?;
+            let count = unsafe { results.GetCount() }
+                .map_err(|e| format!("選択件数を取得できませんでした: {e}"))?;
+
+            let mut paths = Vec::with_capacity(count as usize);
+            for i in 0..count {
+                let item = unsafe { results.GetItemAt(i) }
+                    .map_err(|e| format!("選択項目を取得できませんでした: {e}"))?;
+                let display_name = unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) }
+                    .map_err(|e| format!("ファイルパスを取得できませんでした: {e}"))?;
+                let path = unsafe {
+                    let len = (0..).take_while(|&j| *display_name.0.add(j) != 0).count();
+                    let slice = std::slice::from_raw_parts(display_name.0, len);
+                    std::ffi::OsString::from_wide(slice)
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                unsafe {
+                    windows::Win32::System::Com::CoTaskMemFree(Some(display_name.0.cast()));
+                }
+                paths.push(path);
+            }
+
+            Ok(paths)
+        })();
+
+        unsafe { CoUninitialize() };
+        result
+    }
+
+    #[cfg(not(windows))]
+    {
+        Err("このプラットフォームではファイル選択ダイアログを利用できません。".to_string())
+    }
+}
+
+#[cfg(all(test, windows))]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// テスト終了時にレジストリキーを自動削除する RAII ガード。
+    struct TestRegGuard(String);
+    impl Drop for TestRegGuard {
+        fn drop(&mut self) {
+            let _ = RegKey::predef(HKEY_CURRENT_USER).delete_subkey_all(&self.0);
+        }
+    }
+
+    fn create_test_run_key(suffix: &str) -> (RegKey, TestRegGuard) {
+        let path = format!("Software\\CosmoArtsStore\\_Test_Run_{suffix}");
+        let root = RegKey::predef(HKEY_CURRENT_USER);
+        let (key, _) = root.create_subkey(&path).unwrap();
+        (key, TestRegGuard(path))
+    }
+
+    // ── apply_startup_value（テスト専用 Run キーで検証。実起動キーには触れない） ──
+
+    #[test]
+    fn apply_startup_value_registers_command() {
+        let (key, _guard) = create_test_run_key("register");
+        apply_startup_value(&key, "StellaRecordTest", Some("\"C:\\app\\test.exe\"")).unwrap();
+
+        let stored: String = key.get_value("StellaRecordTest").unwrap();
+        assert_eq!(stored, "\"C:\\app\\test.exe\"");
+    }
+
+    #[test]
+    fn apply_startup_value_removes_existing() {
+        let (key, _guard) = create_test_run_key("remove");
+        key.set_value("StellaRecordTest", &"\"C:\\app\\test.exe\"")
+            .unwrap();
+
+        apply_startup_value(&key, "StellaRecordTest", None).unwrap();
+
+        let result: std::io::Result<String> = key.get_value("StellaRecordTest");
+        assert!(result.is_err(), "値は削除されているはず");
+    }
+
+    #[test]
+    fn apply_startup_value_remove_missing_is_idempotent() {
+        let (key, _guard) = create_test_run_key("remove_missing");
+        // 値が存在しない状態での解除はエラーにならない（冪等）
+        apply_startup_value(&key, "NeverRegistered", None).unwrap();
+    }
+
+    #[test]
+    fn apply_startup_value_overwrites() {
+        let (key, _guard) = create_test_run_key("overwrite");
+        apply_startup_value(&key, "App", Some("\"C:\\v1.exe\"")).unwrap();
+        apply_startup_value(&key, "App", Some("\"C:\\v2.exe\"")).unwrap();
+
+        let stored: String = key.get_value("App").unwrap();
+        assert_eq!(stored, "\"C:\\v2.exe\"");
+    }
+
+    // ── read_exe_display_name ──
+
+    #[test]
+    fn display_name_falls_back_to_file_stem() {
+        // バージョン情報を持たない（存在しない）パスはファイル名（拡張子なし）を返す。
+        let result = read_exe_display_name(Path::new("C:\\nonexistent\\MyCoolApp.exe"));
+        assert_eq!(result, Some("MyCoolApp".to_string()));
+    }
+
+    #[test]
+    fn display_name_reads_real_system_exe() {
+        // 実在するシステム exe からは表示名（FileDescription 等）が取得できる。
+        let notepad = Path::new("C:\\Windows\\System32\\notepad.exe");
+        if notepad.exists() {
+            let result = read_exe_display_name(notepad);
+            assert!(result.is_some());
+            assert!(!result.unwrap().is_empty());
+        }
+    }
+
+    // ── launch_external_process ──
+
+    #[test]
+    fn launch_external_process_errors_on_missing_exe() {
+        // 存在しない実行ファイルの起動はエラーを返す（プロセスは生成されない）。
+        let result = launch_external_process("Z:\\nonexistent\\never_here.exe");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("起動に失敗しました"));
+    }
+
+    // ── extract_exe_icon_png ──
+
+    #[test]
+    fn extract_icon_produces_valid_png() {
+        // 実在するシステム exe からアイコンを抽出し、PNG として正しくエンコードされることを確認。
+        // COM/シェル API が利用できない環境では None になり得るため、取得できた場合のみ検証する。
+        let notepad = Path::new("C:\\Windows\\System32\\notepad.exe");
+        if notepad.exists() {
+            if let Some(png) = extract_exe_icon_png(notepad) {
+                // PNG シグネチャ: 89 50 4E 47 0D 0A 1A 0A
+                assert!(png.len() > 8);
+                assert_eq!(&png[..8], &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+            }
+        }
+    }
+}
